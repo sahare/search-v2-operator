@@ -47,6 +47,28 @@ export INDEXER_IMAGE=<from cluster>
 - **`make manifests` and `make generate` are separate** — one regenerates CRD/RBAC YAML, the other regenerates Go DeepCopy methods. Both are needed after API type changes.
 - **`docs/RBAC.md`** documents the RBAC roles and bindings created by the operator.
 
+## Architecture Quick Reference
+
+For detailed module-level docs, see the [ACM Search Knowledge Base](https://github.com/sahare/ai-tools/tree/main/projects/acm-search/modules/operator.md).
+
+**Key directories:**
+- `api/v1alpha1/` — CRD types (Search, CollectorConfig), webhook, deepcopy
+- `controllers/` — Reconciler + all `create_*.go` resource builders + seeder
+- `addon/` — OCM add-on manager + embedded Helm chart for collector
+- `config/integration_collector_configs/` — Embedded integration config YAMLs (`go:embed`)
+- `docs/` — ARCHITECTURE.md, RBAC.md
+
+**Critical rules (production incidents from skipping these):**
+1. CRD changes → MUST manually mirror to `addon/manifests/chart/templates/collectorconfig_crd.yaml`
+2. New status subresource → RBAC needed in 5 places across 2 repos (see KB)
+3. `[]metav1.Condition` fields → always add `+listType=map` / `+listMapKey=type`
+4. `merged-collector-config` must NOT have the backup label
+
+**Common tasks:**
+- Add a feature flag: annotation const in `controllers/common.go` → new `controllers/feature_setup.go` → call from `Reconcile()`
+- Change CRD types: edit `api/v1alpha1/` → `make manifests` → `make generate` → mirror to addon chart
+- Test with custom image: pause MCH, patch deployment directly or use `imageOverride`
+
 ## Fleet Engineering Skills
 
 All skills are available as slash commands. See the [Fleet Engineering skills catalog](https://github.com/OpenShift-Fleet/agentic-sdlc/blob/main/skills/README.md) for the full list with when-to-use guidance.
