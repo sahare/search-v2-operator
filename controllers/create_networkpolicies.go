@@ -23,6 +23,13 @@ const (
 	multiclusterEngine     = "multicluster-engine"
 )
 
+// hostNetworkPolicyGroupLabel is the well-known OVN-Kubernetes namespaceSelector label used to
+// match traffic from hostNetwork pods (e.g. the kube-apiserver static pods), per OCP's documented
+// "allow-from-hostnetwork" NetworkPolicy pattern. It must be combined with an empty podSelector
+// on the same peer — see:
+// https://docs.redhat.com/en/documentation/openshift_container_platform/4.19/html/network_security/network-policy
+const hostNetworkPolicyGroupLabel = "policy-group.network.openshift.io/host-network"
+
 // Container ports exposed by each Search component. These match the Service definitions in
 // create_pgservice.go, create_indexerservice.go, create_apiservice.go, create_collectorservice.go,
 // and the operator's own metrics/webhook ports in config/manager/manager.yaml.
@@ -244,13 +251,13 @@ func (r *SearchReconciler) CollectorNetworkPolicy(instance *searchv1alpha1.Searc
 //
 // Rationale:
 //   - Ingress (webhook): The Kubernetes API server calls the operator's admission webhook
-//     (CollectorConfig validation) on port 9443. The API server uses hostNetwork: true, so its
-//     traffic cannot be matched by a plain namespaceSelector — OCP/OVN-Kubernetes only matches
-//     hostNetwork traffic when a peer sets BOTH namespaceSelector and podSelector to an empty
-//     LabelSelector (the documented "allow-from-hostnetwork" pattern). An empty namespaceSelector
-//     alone would silently reintroduce this bug. Combined with an empty podSelector, this peer
-//     matches any pod in any namespace plus hostNetwork traffic — i.e. all cluster-internal
-//     traffic, which is the full reachable set for a ClusterIP-only webhook service anyway.
+//     (CollectorConfig validation) on port 9443. The API server uses hostNetwork: true. OCP's
+//     documented "allow-from-hostnetwork" pattern is required to match this traffic: a
+//     namespaceSelector matching the well-known policy-group.network.openshift.io/host-network
+//     label, combined with an empty podSelector, on the SAME peer. A plain empty namespaceSelector
+//     (matching "all namespaces") does NOT include the host-network pseudo-namespace — that was
+//     confirmed to still block the webhook in QE testing (ACM-37052). Only the specific
+//     host-network label selector reliably matches the API server's traffic.
 //   - Ingress (metrics): Prometheus (openshift-monitoring) scrapes the controller-runtime
 //     metrics port.
 //   - Egress: The operator manages nearly every resource type used by Search (Deployments,
@@ -261,15 +268,16 @@ func (r *SearchReconciler) OperatorNetworkPolicy(instance *searchv1alpha1.Search
 	np := newNetworkPolicy(instance, "search-operator", podLabels)
 	np.Spec.Ingress = []networkingv1.NetworkPolicyIngressRule{
 		{
-			// Webhook port: allow from any namespace/pod in the cluster, including
-			// hostNetwork pods. The kube-apiserver uses hostNetwork: true, so an empty
-			// namespaceSelector alone would NOT match it (OCP docs: "Using the
-			// namespaceSelector field without the podSelector field set to {} will not
-			// include hostNetwork pods"). Both selectors must be empty in the same peer
-			// to also match hostNetwork traffic.
+			// Webhook port: allow from the API server's host-network traffic using OCP's
+			// documented allow-from-hostnetwork pattern. A plain empty namespaceSelector does
+			// NOT match hostNetwork pods/traffic — only the well-known
+			// policy-group.network.openshift.io/host-network label selector does, and it must
+			// be paired with an empty podSelector on the same peer.
 			From: []networkingv1.NetworkPolicyPeer{{
-				NamespaceSelector: &metav1.LabelSelector{},
-				PodSelector:       &metav1.LabelSelector{},
+				NamespaceSelector: &metav1.LabelSelector{
+					MatchLabels: map[string]string{hostNetworkPolicyGroupLabel: ""},
+				},
+				PodSelector: &metav1.LabelSelector{},
 			}},
 			Ports: tcpPort(operatorWebhookPort),
 		},

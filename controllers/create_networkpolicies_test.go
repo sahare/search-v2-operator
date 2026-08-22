@@ -70,14 +70,19 @@ func containsNamespaceAndPodSelector(peers []networkingv1.NetworkPolicyPeer, nam
 	return false
 }
 
-// containsEmptyNamespaceAndPodSelector returns true if any peer sets BOTH NamespaceSelector and
-// PodSelector to a non-nil, empty (match-everything) LabelSelector. This is the OCP/OVN-Kubernetes
-// "allow-from-hostnetwork" pattern: it matches pods in any namespace AND hostNetwork traffic,
-// which a namespaceSelector alone does not.
-func containsEmptyNamespaceAndPodSelector(peers []networkingv1.NetworkPolicyPeer) bool {
+// containsHostNetworkAllowPeer returns true if any peer implements OCP's documented
+// "allow-from-hostnetwork" pattern: a namespaceSelector matching the well-known
+// policy-group.network.openshift.io/host-network label, combined with an empty podSelector on
+// the same peer. A plain empty namespaceSelector does NOT match hostNetwork traffic — only this
+// specific label selector does (confirmed by QE testing in ACM-37052).
+func containsHostNetworkAllowPeer(peers []networkingv1.NetworkPolicyPeer) bool {
 	for _, p := range peers {
-		if p.NamespaceSelector != nil && len(p.NamespaceSelector.MatchLabels) == 0 && len(p.NamespaceSelector.MatchExpressions) == 0 &&
-			p.PodSelector != nil && len(p.PodSelector.MatchLabels) == 0 && len(p.PodSelector.MatchExpressions) == 0 {
+		if p.NamespaceSelector == nil || p.PodSelector == nil {
+			continue
+		}
+		v, ok := p.NamespaceSelector.MatchLabels[hostNetworkPolicyGroupLabel]
+		if ok && v == "" && len(p.NamespaceSelector.MatchLabels) == 1 &&
+			len(p.PodSelector.MatchLabels) == 0 && len(p.PodSelector.MatchExpressions) == 0 {
 			return true
 		}
 	}
@@ -247,19 +252,19 @@ func TestOperatorNetworkPolicy(t *testing.T) {
 
 	assert.Equal(t, "controller-manager", np.Spec.PodSelector.MatchLabels["control-plane"])
 
-	var sawWebhookClusterWide, sawWebhookOpenToAll, sawMetricsOpenToAll, sawMonitoring bool
+	var sawWebhookHostNetworkAllow, sawWebhookOpenToAll, sawMetricsOpenToAll, sawMonitoring bool
 	for _, rule := range np.Spec.Ingress {
-		// Webhook rule must use the "allow-from-hostnetwork" pattern: an empty
-		// NamespaceSelector AND an empty PodSelector on the SAME peer. The kube-apiserver
-		// uses hostNetwork: true, so a namespaceSelector alone would NOT match it (OCP
-		// docs: "Using the namespaceSelector field without the podSelector field set to {}
-		// will not include hostNetwork pods"). This still matches any pod in any namespace
-		// plus hostNetwork traffic, i.e. all cluster-internal traffic.
-		if containsEmptyNamespaceAndPodSelector(rule.From) && containsTCPPort(rule.Ports, operatorWebhookPort) {
-			sawWebhookClusterWide = true
+		// Webhook rule must use OCP's documented "allow-from-hostnetwork" pattern: a
+		// namespaceSelector matching policy-group.network.openshift.io/host-network,
+		// combined with an empty podSelector on the SAME peer. A plain empty
+		// namespaceSelector does NOT reliably match hostNetwork traffic (confirmed by QE
+		// in ACM-37052 — it still blocked the webhook).
+		if containsHostNetworkAllowPeer(rule.From) && containsTCPPort(rule.Ports, operatorWebhookPort) {
+			sawWebhookHostNetworkAllow = true
 		}
-		// A completely bare From (or one with no selectors at all) would also allow
-		// hostNetwork traffic, but is over-broad and must NOT be used for the webhook.
+		// A completely bare From (no selectors at all) is over-broad and must NOT be used
+		// for the webhook — the host-network label selector above is the correct, scoped
+		// way to allow the API server's traffic.
 		if len(rule.From) == 0 && containsTCPPort(rule.Ports, operatorWebhookPort) {
 			sawWebhookOpenToAll = true
 		}
@@ -270,12 +275,12 @@ func TestOperatorNetworkPolicy(t *testing.T) {
 			sawMonitoring = true
 		}
 	}
-	assert.True(t, sawWebhookClusterWide,
-		"expected webhook ingress with empty namespaceSelector+podSelector on the same peer "+
-			"(API server uses hostNetwork, requires the allow-from-hostnetwork pattern)")
+	assert.True(t, sawWebhookHostNetworkAllow,
+		"expected webhook ingress using the allow-from-hostnetwork pattern "+
+			"(policy-group.network.openshift.io/host-network namespaceSelector + empty podSelector)")
 	assert.False(t, sawWebhookOpenToAll,
 		"webhook ingress must not use a completely unrestricted From — it should be scoped "+
-			"to the cluster via the empty namespaceSelector+podSelector peer")
+			"via the allow-from-hostnetwork peer")
 	assert.False(t, sawMetricsOpenToAll,
 		"metrics port must NOT have unrestricted ingress — only openshift-monitoring should reach it")
 	assert.True(t, sawMonitoring, "expected ingress from openshift-monitoring for metrics")
